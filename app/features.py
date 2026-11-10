@@ -4,8 +4,14 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
+from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
+from sklearn.preprocessing import (
+    FunctionTransformer,
+    OneHotEncoder,
+    StandardScaler,
+    TargetEncoder,
+)
 
 ARQUIVOS = {
     "orders": "olist_orders_dataset.csv",
@@ -31,21 +37,23 @@ LNG_MIN, LNG_MAX = -73.9, -34.7
 RAIO_TERRA_KM = 6371
 
 # Grupos de features usados no ColumnTransformer.
-COLUNAS_ASSIMETRICAS = ["frete_total", "preco_total", "peso_total_g", "volume_max_cm3"]
+COLUNAS_ASSIMETRICAS = ["frete_total", "preco_total", "peso_total_g", "volume_total_cm3"]
 COLUNAS_NUMERICAS = [
     "dist_km",
     "n_itens",
-    "n_vendedores",
     "customer_lat",
     "customer_lng",
     "seller_lat",
     "seller_lng",
-    "mes",
+    "mes_sin",
+    "mes_cos",
     "dia_semana",
     "hora",
 ]
-COLUNAS_BINARIAS = ["mesmo_estado"]
-COLUNAS_CATEGORICAS = ["customer_state", "seller_state", "categoria"]
+COLUNAS_BINARIAS = ["mesmo_estado", "varios_vendedores"]
+COLUNAS_CATEGORICAS = ["customer_state", "seller_state"]
+# Muitas categorias de produto: target encoding em vez de one-hot.
+COLUNAS_TARGET_ENCODING = ["categoria"]
 
 
 def carregar_tabelas(data_dir):
@@ -142,6 +150,11 @@ def construir_dataset(tabelas):
 
     # Calendário da compra.
     pedidos["mes"] = compra.dt.month
+    # Mês cíclico: dezembro fica perto de janeiro. Precisa de seno e cosseno,
+    # porque só o seno dá o mesmo valor para meses diferentes (ex.: março e abril).
+    angulo_mes = 2 * np.pi * (pedidos["mes"] - 1) / 12
+    pedidos["mes_sin"] = np.sin(angulo_mes)
+    pedidos["mes_cos"] = np.cos(angulo_mes)
     pedidos["dia_semana"] = compra.dt.dayofweek
     pedidos["hora"] = compra.dt.hour
 
@@ -230,10 +243,12 @@ def construir_dataset(tabelas):
         n_vendedores=("seller_id", "nunique"),
         preco_total=("price", "sum"),
         frete_total=("freight_value", "sum"),
-        volume_max_cm3=("volume_cm3", "max"),
     )
-    # min_count=1: pedido sem nenhum peso conhecido fica ausente em vez de 0.
+    # min_count=1: pedido sem nenhum peso/volume conhecido fica ausente em vez de 0.
     agregado["peso_total_g"] = itens.groupby("order_id")["product_weight_g"].sum(
+        min_count=1
+    )
+    agregado["volume_total_cm3"] = itens.groupby("order_id")["volume_cm3"].sum(
         min_count=1
     )
 
@@ -261,6 +276,8 @@ def construir_dataset(tabelas):
         pedidos["seller_lat"],
         pedidos["seller_lng"],
     )
+    # 98,7% dos pedidos têm um único vendedor: a contagem vira binária.
+    pedidos["varios_vendedores"] = (pedidos["n_vendedores"] > 1).astype(int)
     pedidos["mesmo_estado"] = (
         pedidos["customer_state"] == pedidos["seller_state"]
     ).astype(int)
@@ -271,10 +288,12 @@ def construir_dataset(tabelas):
 
     colunas = (
         ["order_id", "order_purchase_timestamp", "y", "prazo_estimado"]
+        + ["mes", "n_vendedores"]
         + COLUNAS_ASSIMETRICAS
         + COLUNAS_NUMERICAS
         + COLUNAS_BINARIAS
         + COLUNAS_CATEGORICAS
+        + COLUNAS_TARGET_ENCODING
         + ["coord_cliente_imputada", "coord_vendedor_imputada", "coord_imputada"]
     )
     return pedidos[colunas].reset_index(drop=True)
@@ -282,21 +301,18 @@ def construir_dataset(tabelas):
 
 def colunas_features(usar_categoria=True):
     """Lista das colunas que entram em X."""
-    categoricas = (
-        COLUNAS_CATEGORICAS
-        if usar_categoria
-        else [c for c in COLUNAS_CATEGORICAS if c != "categoria"]
+    target_encoding = COLUNAS_TARGET_ENCODING if usar_categoria else []
+    return (
+        COLUNAS_ASSIMETRICAS
+        + COLUNAS_NUMERICAS
+        + COLUNAS_BINARIAS
+        + COLUNAS_CATEGORICAS
+        + target_encoding
     )
-    return COLUNAS_ASSIMETRICAS + COLUNAS_NUMERICAS + COLUNAS_BINARIAS + categoricas
 
 
 def criar_preprocessador(usar_categoria=True):
     """ColumnTransformer da etapa 2."""
-    categoricas = (
-        COLUNAS_CATEGORICAS
-        if usar_categoria
-        else [c for c in COLUNAS_CATEGORICAS if c != "categoria"]
-    )
 
     assimetricas = Pipeline(
         [
@@ -315,11 +331,20 @@ def criar_preprocessador(usar_categoria=True):
         handle_unknown="ignore", min_frequency=100, sparse_output=False
     )
 
-    return ColumnTransformer(
-        [
-            ("assimetricas", assimetricas, COLUNAS_ASSIMETRICAS),
-            ("numericas", numericas, COLUNAS_NUMERICAS),
-            ("binarias", "passthrough", COLUNAS_BINARIAS),
-            ("categoricas", categoricas_pipe, categoricas),
-        ]
+    # O TargetEncoder usa validação cruzada interna no fit_transform, então a
+    # média de y de uma linha não vaza para a própria codificação.
+    target_encoding_pipe = TargetEncoder(
+        target_type="continuous", cv=KFold(5, shuffle=True, random_state=42)
     )
+
+    transformadores = [
+        ("assimetricas", assimetricas, COLUNAS_ASSIMETRICAS),
+        ("numericas", numericas, COLUNAS_NUMERICAS),
+        ("binarias", "passthrough", COLUNAS_BINARIAS),
+        ("categoricas", categoricas_pipe, COLUNAS_CATEGORICAS),
+    ]
+    if usar_categoria:
+        transformadores.append(
+            ("target_encoding", target_encoding_pipe, COLUNAS_TARGET_ENCODING)
+        )
+    return ColumnTransformer(transformadores)
